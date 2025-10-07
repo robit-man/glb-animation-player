@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Anim viewer — drag/drop + auto idle/walk/run/crouch — three@0.177.0</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script async src="https://ga.jspm.io/npm:es-module-shims@1.10.0/dist/es-module-shims.js" crossorigin="anonymous"></script>
+
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.177.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.177.0/examples/jsm/"
+      }
+    }
+    </script>
+
+    <style>
+      :root { color-scheme: dark; }
+      html, body { height: 100%; margin: 0; background:#0b0c10; color:#e6e6e6; font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+      #app { position: fixed; inset: 0; display: grid; grid-template-rows: 1fr auto; }
+      #panel {
+        position:fixed; bottom:0; left:0; right:0; display:flex; flex-wrap:wrap; gap:.5rem; padding:.75rem;
+        background:rgba(0,0,0,.35); backdrop-filter: blur(6px); border-top:1px solid rgba(255,255,255,.08); align-items:center;
+      }
+      button {
+        border:1px solid rgba(255,255,255,.18); background:rgba(255,255,255,.06); color:#fff; padding:.5rem .8rem; border-radius:.6rem; cursor:pointer;
+      }
+      button:hover { background:rgba(255,255,255,.12); }
+      .badge { font-size:12px; opacity:.75; padding:.2rem .5rem; border:1px solid rgba(255,255,255,.18); border-radius:.5rem; }
+      #clips { display:flex; gap:.5rem; flex-wrap:wrap; max-width:50vw; overflow:auto; }
+      #log { margin-left:auto; opacity:.8; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:36vw; }
+      label { display:inline-flex; align-items:center; gap:.35rem; opacity:.9; }
+      canvas { display:block; }
+
+      /* drag & drop overlay */
+      #dropZone {
+        position: fixed; inset: 0; display:none; place-items:center; pointer-events:none;
+        background: rgba(0,0,0,.35);
+        border: 2px dashed rgba(255,255,255,.25);
+      }
+      #dropZone .inner {
+        pointer-events:none;
+        font-size: 18px; opacity:.85; padding:1rem 1.25rem; border-radius:.8rem; border:1px solid rgba(255,255,255,.25);
+        background: rgba(0,0,0,.5);
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="app">
+      <canvas id="c"></canvas>
+      <div id="panel">
+        <span class="badge">three@0.177.0</span>
+        <button id="openBtn">Import model…</button>
+        <label><input id="skelToggle" type="checkbox" checked /> show skeleton</label>
+        <label><input id="autoToggle" type="checkbox" checked /> auto locomotion</label>
+        <div id="clips"></div>
+        <span id="log">Drop a consolidated .glb or click Import…</span>
+      </div>
+
+      <div id="dropZone"><div class="inner">Drop a consolidated .glb model (with animations)</div></div>
+      <input id="fileInput" type="file" accept=".glb,.gltf,model/gltf-binary,model/gltf+json" hidden />
+    </div>
+
+    <script type="module">
+      import * as THREE from 'three';
+      import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+      import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+      import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+      // ---------- UI refs ----------
+      const canvas = document.getElementById('c');
+      const clipsEl = document.getElementById('clips');
+      const skelToggle = document.getElementById('skelToggle');
+      const autoToggle = document.getElementById('autoToggle');
+      const openBtn = document.getElementById('openBtn');
+      const fileInput = document.getElementById('fileInput');
+      const dropZone = document.getElementById('dropZone');
+      const logEl = document.getElementById('log');
+      const log = (m) => (logEl.textContent = m);
+
+      // ---------- three setup ----------
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x0f1116);
+
+      const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 100);
+      camera.position.set(2.8, 1.6, 3.6);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.target.set(0, 1.2, 0);
+      controls.enableDamping = true;
+
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x222233, 0.85));
+      const key = new THREE.DirectionalLight(0xffffff, 1.15);
+      key.position.set(4, 6, 4);
+      scene.add(key);
+      scene.add(new THREE.GridHelper(20, 20, 0x444444, 0x222222));
+
+      // ---------- loaders ----------
+      const loader = new GLTFLoader();
+      const draco = new DRACOLoader();
+      draco.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.177.0/examples/jsm/libs/draco/');
+      loader.setDRACOLoader(draco);
+
+      // ---------- runtime state ----------
+      let currentRoot = null;
+      let mixer = null;
+      let currentAction = null;
+      let helper = null;
+      let actions = new Map();
+      let clips = [];
+
+      // Role mapping; crouch split into idle/walk variants
+      const roles = { idle:null, walk:null, run:null, crouchIdle:null, crouchWalk:null };
+
+      // Input
+      const input = { f:false, b:false, l:false, r:false, shift:false, ctrl:false };
+      const movementKeys = new Set(['ArrowUp','KeyW','KeyA','KeyS','KeyD','ArrowLeft','ArrowRight','ArrowDown']);
+
+      // ---------- small helpers ----------
+      function getFirstSkinnedMesh(root) {
+        let m = null; root.traverse(o => { if (!m && o.isSkinnedMesh && o.skeleton) m = o; });
+        return m;
+      }
+      function animationsUseBonesBinding(animations) {
+        return animations?.some(clip => clip.tracks.some(t => t.name.startsWith('.bones['))) || false;
+      }
+      const norm = (s) => (s||'').toLowerCase().replace(/[_\-]+/g,' ').trim();
+      const containsWord = (s, w) => new RegExp(`(?:^|[^a-z0-9])${w.toLowerCase()}(?:$|[^a-z0-9])`).test(s);
+      const hasAny = (s, arr) => arr.some(x => containsWord(s, x));
+      const DISALLOW_FOR_WALK = ['crouch','sneak','stealth','crawl','prone'];
+      const DISALLOW_FOR_RUN  = ['crouch','sneak','stealth','crawl','prone'];
+
+      function clearCurrent() {
+        if (currentAction) { currentAction.stop(); currentAction = null; }
+        if (mixer) { try { mixer.stopAllAction(); } catch{} }
+        if (helper) { scene.remove(helper); helper = null; }
+        if (currentRoot) { scene.remove(currentRoot); currentRoot = null; }
+        actions.clear();
+        clips = [];
+        roles.idle = roles.walk = roles.run = roles.crouchIdle = roles.crouchWalk = null;
+        clipsEl.innerHTML = '';
+      }
+
+      function buildUI() {
+        clipsEl.innerHTML = '';
+        clips.forEach((clip, i) => {
+          const btn = document.createElement('button');
+          btn.textContent = clip.name || `Clip ${i+1}`;
+          btn.onclick = () => {
+            autoToggle.checked = false; // manual override
+            playClipByName(clip.name);
+            log(`playing: ${clip.name}`);
+          };
+          clipsEl.appendChild(btn);
+        });
+      }
+
+      function autoMapRoles() {
+        if (!clips.length) return;
+
+        // Pre-index names (normalized)
+        const entries = clips.map(c => ({ clip:c, name:norm(c.name) }));
+
+        const pickExact = (...names) => {
+          const candidates = names.map(norm);
+          return entries.find(e => candidates.includes(e.name))?.clip || null;
+        };
+
+        const pickContains = (names, { disallow=[] } = {}) => {
+          const nset = names.map(norm);
+          // score: prefer first name that is a whole-word match, and penalize disallowed terms
+          let best = null, bestScore = -1e9;
+          for (const e of entries) {
+            if (disallow.length && hasAny(e.name, disallow)) continue;
+            let score = 0;
+            for (let i=0;i<nset.length;i++) {
+              const n = nset[i];
+              if (e.name === n) score += 100 - i; // exact
+              else if (containsWord(e.name, n)) score += 60 - i; // whole-word
+              else if (e.name.includes(n)) score += 20 - i; // substring
+            }
+            // minor tie-break: shorter names (more specific) win
+            score -= e.name.length * 0.01;
+            if (score > bestScore) { bestScore = score; best = e.clip; }
+          }
+          return best;
+        };
+
+        // Idle family (avoid crouch variants)
+        roles.idle = pickExact('idle','breathing','stand','standing') ||
+                     pickContains(['idle','breathing','stand','standing'], { disallow: DISALLOW_FOR_WALK });
+
+        // Walk (explicitly exclude crouch/sneak/stealth/crawl)
+        roles.walk = pickExact('walk','walking') ||
+                     pickContains(['walk','walking','locomotion','move','moving'], { disallow: DISALLOW_FOR_WALK });
+
+        // Run (prefer sprint, then run, then jog; exclude crouch-like)
+        roles.run = pickExact('sprint','run','jog') ||
+                    pickContains(['sprint','run','jog'], { disallow: DISALLOW_FOR_RUN });
+
+        // Crouch Walk / Idle
+        roles.crouchWalk = pickExact('crouch walk','sneak walk','stealth walk','crawl') ||
+                           pickContains(['crouch walk','sneak walk','stealth walk','crawl']);
+        roles.crouchIdle = pickExact('crouch idle','crouch','sneak idle','sneak','stealth idle','stealth') ||
+                           pickContains(['crouch idle','crouch','sneak idle','sneak','stealth idle','stealth']);
+
+        console.log('Roles:', Object.fromEntries(Object.entries(roles).map(([k,v])=>[k, v?.name||'—'])));
+      }
+
+      function playClipByName(name, fade=0.2, opts={}) {
+        const clip = clips.find(c => c.name === name);
+        if (clip) playClip(clip, fade, opts);
+      }
+
+      function playRole(role, opts={}) {
+        const clip = roles[role];
+        if (!clip) return false;
+        playClip(clip, 0.2, opts);
+        log(`auto: ${role} (${clip.name})`);
+        return true;
+      }
+
+      function playClip(clip, fade=0.2, { speed=1.0 } = {}) {
+        if (!mixer || !clip) return;
+        const next = actions.get(clip.name) || mixer.clipAction(clip);
+
+        // normalize speed on all, then set active
+        actions.forEach(a => a.setEffectiveTimeScale(1));
+        next.setEffectiveTimeScale(speed);
+
+        next.reset();
+        next.setLoop(THREE.LoopRepeat, Infinity);
+        next.enabled = true;
+        next.setEffectiveWeight(1);
+        next.play();
+
+        if (currentAction && currentAction !== next) currentAction.crossFadeTo(next, fade, false);
+        currentAction = next;
+      }
+
+      function updateAutoState() {
+        const moving = input.f || input.b || input.l || input.r;
+
+        // Ctrl fully gates crouch states
+        if (input.ctrl) {
+          if (moving) {
+            if (!playRole('crouchWalk')) {
+              if (!playRole('crouchIdle')) playRole('idle');
+            }
+          } else {
+            if (!playRole('crouchIdle')) {
+              if (!playRole('crouchWalk')) playRole('idle');
+            }
+          }
+          return;
+        }
+
+        // Not crouching → normal locomotion
+        if (moving && input.shift) {
+          if (!playRole('run')) {
+            if (!playRole('walk', { speed:1.6 })) playRole('idle');
+          }
+        } else if (moving) {
+          if (!playRole('walk')) playRole('idle');
+        } else {
+          playRole('idle');
+        }
+      }
+
+      // ---------- input listeners ----------
+      addEventListener('keydown', (e) => {
+        if (e.repeat) return;
+        switch (e.code) {
+          case 'ArrowUp': case 'KeyW': input.f = true; break;
+          case 'ArrowDown': case 'KeyS': input.b = true; break;
+          case 'ArrowLeft': case 'KeyA': input.l = true; break;
+          case 'ArrowRight': case 'KeyD': input.r = true; break;
+          case 'ShiftLeft': case 'ShiftRight': input.shift = true; break;
+          case 'ControlLeft': case 'ControlRight': input.ctrl = true; break;
+        }
+        if (autoToggle.checked && (movementKeys.has(e.code) || e.code.startsWith('Shift') || e.code.startsWith('Control'))) {
+          updateAutoState();
+        }
+      });
+
+      addEventListener('keyup', (e) => {
+        switch (e.code) {
+          case 'ArrowUp': case 'KeyW': input.f = false; break;
+          case 'ArrowDown': case 'KeyS': input.b = false; break;
+          case 'ArrowLeft': case 'KeyA': input.l = false; break;
+          case 'ArrowRight': case 'KeyD': input.r = false; break;
+          case 'ShiftLeft': case 'ShiftRight': input.shift = false; break;
+          case 'ControlLeft': case 'ControlRight': input.ctrl = false; break;
+        }
+        if (autoToggle.checked && (movementKeys.has(e.code) || e.code.startsWith('Shift') || e.code.startsWith('Control'))) {
+          updateAutoState();
+        }
+      });
+
+      // ---------- model loading ----------
+      async function parseFileToGLTF(file) {
+        const buf = await file.arrayBuffer();
+        return new Promise((resolve, reject) => {
+          loader.parse(buf, '', (gltf) => resolve(gltf), (err) => reject(err));
+        });
+      }
+
+      async function loadModelFromGLTF(gltf, label = '') {
+        clearCurrent();
+
+        // add to scene
+        currentRoot = gltf.scene;
+        scene.add(currentRoot);
+
+        clips = gltf.animations || [];
+        if (!clips.length) {
+          log('No animations found in model.');
+          return;
+        }
+
+        // mixer root: node vs bones binding
+        const useBonesBinding = animationsUseBonesBinding(clips);
+        const mixRoot = useBonesBinding ? (getFirstSkinnedMesh(currentRoot) || currentRoot) : currentRoot;
+
+        mixer = new THREE.AnimationMixer(mixRoot);
+
+        // skeleton helper
+        const helperTarget = getFirstSkinnedMesh(currentRoot) || currentRoot;
+        helper = new THREE.SkeletonHelper(helperTarget);
+        helper.material.color.set(0xffaa00);
+        helper.visible = skelToggle.checked;
+        scene.add(helper);
+        skelToggle.addEventListener('change', () => { if (helper) helper.visible = skelToggle.checked; });
+
+        // cache actions
+        actions.clear();
+        for (const clip of clips) {
+          const act = mixer.clipAction(clip);
+          act.setLoop(THREE.LoopRepeat, Infinity);
+          act.clampWhenFinished = false;
+          act.enabled = true;
+          act.setEffectiveWeight(1);
+          actions.set(clip.name, act);
+        }
+
+        // build UI + map roles
+        buildUI();
+        autoMapRoles();
+
+        // start based on current keys (usually idle)
+        updateAutoState();
+
+        const name = label || 'model';
+        log(`Loaded ${name} — ${clips.length} clip(s). Use arrow keys/WASD, Shift=run, Ctrl=crouch.`);
+      }
+
+      // Load by URL (optional default)
+      async function loadModelFromURL(url) {
+        return new Promise((resolve, reject) => {
+          loader.load(url, resolve, undefined, reject);
+        }).then(async (gltf) => loadModelFromGLTF(gltf, url.split('/').pop()));
+      }
+
+      // ---------- drag & drop + file input ----------
+      function showDrop(v){ dropZone.style.display = v ? 'grid' : 'none'; }
+
+      addEventListener('dragenter', (e) => { e.preventDefault(); showDrop(true); });
+      addEventListener('dragover',  (e) => { e.preventDefault(); showDrop(true); });
+      addEventListener('dragleave', (e) => { e.preventDefault(); showDrop(false); });
+      addEventListener('drop', async (e) => {
+        e.preventDefault(); showDrop(false);
+        const files = [...(e.dataTransfer?.files || [])].filter(f => /\.(glb|gltf)$/i.test(f.name));
+        if (!files.length) return;
+        const file = files[0]; // viewer supports one model at a time
+        try {
+          const gltf = await parseFileToGLTF(file);
+          await loadModelFromGLTF(gltf, file.name);
+        } catch (err) {
+          console.error(err);
+          log('Failed to load dropped file (prefer .glb): ' + (err?.message || err));
+        }
+      });
+
+      openBtn.onclick = () => fileInput.click();
+      fileInput.onchange = async (e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        try {
+          const gltf = await parseFileToGLTF(file);
+          await loadModelFromGLTF(gltf, file.name);
+        } catch (err) {
+          console.error(err);
+          log('Failed to load selected file (prefer .glb): ' + (err?.message || err));
+        } finally {
+          fileInput.value = '';
+        }
+      };
+
+      // ---------- animation/render loop ----------
+      const clock = new THREE.Clock();
+      renderer.setAnimationLoop(() => {
+        const dt = clock.getDelta();
+        if (mixer) mixer.update(dt);
+        controls.update();
+        renderer.render(scene, camera);
+      });
+
+      addEventListener('resize', () => {
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      });
+
+      // OPTIONAL: auto-load a default model by URL.
+      // Comment this out if you only want drag/drop.
+      // loadModelFromURL('/models/consolidated.glb').catch(()=>{});
+    </script>
+  </body>
+</html>
