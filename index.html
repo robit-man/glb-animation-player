@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>Anim viewer — drag/drop + auto idle/walk/run/crouch — three@0.177.0</title>
+    <title>Anim viewer — mapping-only + default + centered — three@0.177.0</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <script async src="https://ga.jspm.io/npm:es-module-shims@1.10.0/dist/es-module-shims.js" crossorigin="anonymous"></script>
 
@@ -27,11 +27,21 @@
         border:1px solid rgba(255,255,255,.18); background:rgba(255,255,255,.06); color:#fff; padding:.5rem .8rem; border-radius:.6rem; cursor:pointer;
       }
       button:hover { background:rgba(255,255,255,.12); }
+      button[disabled] { opacity:.5; cursor:not-allowed; }
       .badge { font-size:12px; opacity:.75; padding:.2rem .5rem; border:1px solid rgba(255,255,255,.18); border-radius:.5rem; }
-      #clips { display:flex; gap:.5rem; flex-wrap:wrap; max-width:50vw; overflow:auto; }
-      #log { margin-left:auto; opacity:.8; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:36vw; }
       label { display:inline-flex; align-items:center; gap:.35rem; opacity:.9; }
       canvas { display:block; }
+
+      #clips { display:flex; gap:.5rem; flex-wrap:wrap; max-width:50vw; overflow:auto; align-items:flex-start; }
+      .clipBtn { display:inline-flex; align-items:center; gap:.35rem; }
+      .clipBtn[data-selected="true"] { box-shadow: 0 0 0 2px rgba(255,200,0,.25) inset; }
+      .clipBtn[data-active="true"]   { box-shadow: 0 0 0 2px rgba(120,200,255,.35) inset; }
+      .comboBadge {
+        font-size:11px; opacity:.85; padding:.15rem .35rem; border:1px solid rgba(255,255,255,.18);
+        border-radius:.4rem; background:rgba(255,255,255,.06);
+      }
+
+      #log { margin-left:auto; opacity:.85; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:24vw; }
 
       /* drag & drop overlay */
       #dropZone {
@@ -44,6 +54,20 @@
         font-size: 18px; opacity:.85; padding:1rem 1.25rem; border-radius:.8rem; border:1px solid rgba(255,255,255,.25);
         background: rgba(0,0,0,.5);
       }
+
+      /* recorder panel */
+      #recorder {
+        position: fixed; right: 12px; top: 12px; min-width: 300px; max-width: 40vw;
+        background: rgba(12,14,18,.92); border:1px solid rgba(255,255,255,.12); border-radius:12px; padding:10px;
+        display:none; gap:.5rem;
+      }
+      #recorder h4 { margin:0 0 .5rem 0; font-size:14px; opacity:.95; }
+      #comboList { display:flex; flex-wrap:wrap; gap:.35rem; margin-top:.35rem; }
+      #comboList .item { display:inline-flex; align-items:center; gap:.25rem; }
+      #comboList .rm { padding:.1rem .3rem; }
+      #recordBar { display:flex; gap:.35rem; align-items:center; flex-wrap:wrap; }
+      #countdown { font-variant-numeric: tabular-nums; opacity:.9; }
+      .ghost { opacity:.7; }
     </style>
   </head>
 
@@ -52,15 +76,28 @@
       <canvas id="c"></canvas>
       <div id="panel">
         <span class="badge">three@0.177.0</span>
-        <button id="openBtn">Import model…</button>
+        <button id="openBtn">Import model/map…</button>
         <label><input id="skelToggle" type="checkbox" checked /> show skeleton</label>
-        <label><input id="autoToggle" type="checkbox" checked /> auto locomotion</label>
+        <button id="recordBtn" disabled>Record associated actions</button>
+        <button id="addComboBtn" disabled title="Add a new key combo for the selected animation">+</button>
+        <button id="exportMapBtn" disabled>Export mapping JSON</button>
         <div id="clips"></div>
-        <span id="log">Drop a consolidated .glb or click Import…</span>
+        <span id="log">Drop a consolidated .glb or a .json key map, or click “Import model/map…”</span>
       </div>
 
-      <div id="dropZone"><div class="inner">Drop a consolidated .glb model (with animations)</div></div>
-      <input id="fileInput" type="file" accept=".glb,.gltf,model/gltf-binary,model/gltf+json" hidden />
+      <div id="dropZone"><div class="inner">Drop a .glb/.gltf model or a .json mapping</div></div>
+      <input id="fileInput" type="file" accept=".glb,.gltf,model/gltf-binary,model/gltf+json,.json,application/json" hidden />
+
+      <!-- Recorder / Mapping panel -->
+      <div id="recorder">
+        <h4 id="recTitle">Mapping for: —</h4>
+        <div id="comboList"></div>
+        <div id="recordBar">
+          <button id="startRecordBtn">Record key combination</button>
+          <span id="recHint" class="ghost">Press keys together. Each press refreshes the 3s countdown.</span>
+          <span id="countdown"></span>
+        </div>
+      </div>
     </div>
 
     <script type="module">
@@ -69,14 +106,28 @@
       import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
       import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
+      // ---------- constants ----------
+      const FADE_DUR = 0.28; // smooth cross-fade duration (seconds)
+      const ANCHOR_BONE_CANDIDATES = ['Hips','hips','Root','root','Pelvis','pelvis','Hips01','mixamorigHips'];
+
       // ---------- UI refs ----------
       const canvas = document.getElementById('c');
       const clipsEl = document.getElementById('clips');
       const skelToggle = document.getElementById('skelToggle');
-      const autoToggle = document.getElementById('autoToggle');
       const openBtn = document.getElementById('openBtn');
       const fileInput = document.getElementById('fileInput');
       const dropZone = document.getElementById('dropZone');
+      const recordBtn = document.getElementById('recordBtn');
+      const addComboBtn = document.getElementById('addComboBtn');
+      const exportMapBtn = document.getElementById('exportMapBtn');
+
+      const recPanel = document.getElementById('recorder');
+      const recTitle = document.getElementById('recTitle');
+      const comboListEl = document.getElementById('comboList');
+      const startRecordBtn = document.getElementById('startRecordBtn');
+      const recHint = document.getElementById('recHint');
+      const countdownEl = document.getElementById('countdown');
+
       const logEl = document.getElementById('log');
       const log = (m) => (logEl.textContent = m);
 
@@ -116,14 +167,31 @@
       let actions = new Map();
       let clips = [];
 
-      // Role mapping; crouch split into idle/walk variants
-      const roles = { idle:null, walk:null, run:null, crouchIdle:null, crouchWalk:null };
+      // default fallback clip when no combo is pressed
+      let defaultClipName = null;
 
-      // Input
-      const input = { f:false, b:false, l:false, r:false, shift:false, ctrl:false };
-      const movementKeys = new Set(['ArrowUp','KeyW','KeyA','KeyS','KeyD','ArrowLeft','ArrowRight','ArrowDown']);
+      // mapping (combo ⇄ clip)
+      let selectedClip = null;
+      const STORAGE_KEY = 'animKeyMap.mappingOnly.centered.v1';
+      let modelSig = '';
+      let keyMap = {};            // { [clipName]: [combo, ...] }
+      let reverseMap = new Map(); // combo -> clipName
 
-      // ---------- small helpers ----------
+      // recording state
+      let recordingActive = false;
+      let recordHeld = new Set();
+      let countdownTimer = null;
+      const COUNTDOWN_SECS = 3;
+
+      // pressed keys live
+      const pressedNow = new Set();
+
+      // anchor to keep the character centered
+      let anchorBone = null;
+      const _tmpWorld = new THREE.Vector3();
+      const _anchorBase = new THREE.Vector3();
+
+      // ---------- helpers ----------
       function getFirstSkinnedMesh(root) {
         let m = null; root.traverse(o => { if (!m && o.isSkinnedMesh && o.skeleton) m = o; });
         return m;
@@ -131,12 +199,198 @@
       function animationsUseBonesBinding(animations) {
         return animations?.some(clip => clip.tracks.some(t => t.name.startsWith('.bones['))) || false;
       }
-      const norm = (s) => (s||'').toLowerCase().replace(/[_\-]+/g,' ').trim();
-      const containsWord = (s, w) => new RegExp(`(?:^|[^a-z0-9])${w.toLowerCase()}(?:$|[^a-z0-9])`).test(s);
-      const hasAny = (s, arr) => arr.some(x => containsWord(s, x));
-      const DISALLOW_FOR_WALK = ['crouch','sneak','stealth','crawl','prone'];
-      const DISALLOW_FOR_RUN  = ['crouch','sneak','stealth','crawl','prone'];
 
+      function chooseDefaultClip(animations) {
+        if (!animations?.length) return null;
+        // prefer typical idles
+        const prefer = ['Idle','idle','Breathing','breathing','Stand','stand','Standing','standing'];
+        for (const name of prefer) {
+          const c = animations.find(a => a.name === name || a.name.toLowerCase() === name.toLowerCase());
+          if (c) return c;
+        }
+        // else pick the longest (tends to be a loop)
+        return animations.reduce((a,b) => (a.duration >= b.duration ? a : b));
+      }
+
+      function canonicalizeComboFromSet(set) {
+        const mods = [];
+        const keys = [];
+        for (const code of set) {
+          if (code.startsWith('Shift')) mods.push('Shift');
+          else if (code.startsWith('Control')) mods.push('Ctrl');
+          else if (code.startsWith('Alt')) mods.push('Alt');
+          else if (code.startsWith('Meta')) mods.push('Meta');
+          else keys.push(code);
+        }
+        const uniq = (arr) => [...new Set(arr)];
+        const modOrder = ['Ctrl','Shift','Alt','Meta'];
+        const modsSorted = uniq(mods).sort((a,b)=>modOrder.indexOf(a)-modOrder.indexOf(b));
+        keys.sort();
+        return [...modsSorted, ...keys].join('+') || '';
+      }
+
+      function canonicalizeComboString(str) {
+        if (!str || typeof str !== 'string') return '';
+        const raw = str.split('+').map(s => s.trim()).filter(Boolean);
+
+        const modMap = new Map([
+          ['ctrl','Ctrl'], ['control','Ctrl'],
+          ['shift','Shift'],
+          ['alt','Alt'], ['option','Alt'], ['opt','Alt'], ['⌥','Alt'],
+          ['meta','Meta'], ['cmd','Meta'], ['command','Meta'], ['win','Meta'], ['super','Meta'], ['⌘','Meta']
+        ]);
+        const keyAlias = new Map([
+          ['left','ArrowLeft'], ['←','ArrowLeft'],
+          ['right','ArrowRight'], ['→','ArrowRight'],
+          ['up','ArrowUp'], ['↑','ArrowUp'],
+          ['down','ArrowDown'], ['↓','ArrowDown'],
+          ['space','Space'], ['spacebar','Space'],
+          ['return','Enter']
+        ]);
+
+        const mods = [];
+        const keys = [];
+
+        for (let t of raw) {
+          const lower = t.toLowerCase();
+
+          if (modMap.has(lower)) { mods.push(modMap.get(lower)); continue; }
+          if (keyAlias.has(lower)) { keys.push(keyAlias.get(lower)); continue; }
+
+          if (/^[a-z]$/i.test(t)) { keys.push(`Key${t.toUpperCase()}`); continue; }
+          if (/^[0-9]$/.test(t)) { keys.push(`Digit${t}`); continue; }
+
+          keys.push(t);
+        }
+
+        const uniq = (arr) => [...new Set(arr)];
+        const modOrder = ['Ctrl','Shift','Alt','Meta'];
+        const modsSorted = uniq(mods).sort((a,b)=>modOrder.indexOf(a)-modOrder.indexOf(b));
+        keys.sort();
+        return [...modsSorted, ...keys].join('+');
+      }
+
+      function downloadText(filename, text) {
+        const blob = new Blob([text], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob); a.download = filename;
+        document.body.appendChild(a); a.click();
+        setTimeout(()=>{ URL.revokeObjectURL(a.href); document.body.removeChild(a); }, 0);
+      }
+
+      function buildModelSignature() {
+        modelSig = clips.map(c => c.name).sort((a,b)=>a.localeCompare(b)).join('|');
+      }
+
+      function loadMapFromStorage() {
+        try {
+          const all = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+          keyMap = all[modelSig] || {};
+        } catch { keyMap = {}; }
+        rebuildReverseMap();
+      }
+      function saveMapToStorage() {
+        try {
+          const all = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+          all[modelSig] = keyMap;
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
+        } catch {}
+      }
+
+      function rebuildReverseMap() {
+        reverseMap.clear();
+        for (const [name, arr] of Object.entries(keyMap)) {
+          if (!Array.isArray(arr)) continue;
+          for (const raw of arr) {
+            const combo = canonicalizeComboString(raw);
+            if (combo && !reverseMap.has(combo)) reverseMap.set(combo, name);
+          }
+        }
+      }
+
+      // ---------- UI: clip list ----------
+      function buildClipsUI() {
+        clipsEl.innerHTML = '';
+        const mapCombos = (name) => (keyMap[name] || []);
+
+        clips.forEach((clip, i) => {
+          const btn = document.createElement('button');
+          btn.className = 'clipBtn';
+          btn.textContent = clip.name || `Clip ${i+1}`;
+          btn.dataset.name = clip.name;
+
+          const combos = mapCombos(clip.name);
+          combos.forEach(combo => {
+            const tag = document.createElement('span');
+            tag.className = 'comboBadge';
+            tag.textContent = combo;
+            btn.appendChild(tag);
+          });
+
+          btn.onclick = () => {
+            selectClip(clip);
+            playClipIfChanged(clip);
+            log(`playing: ${clip.name}`);
+          };
+
+          clipsEl.appendChild(btn);
+        });
+
+        refreshClipSelection();
+      }
+
+      function refreshClipSelection(activeName=null) {
+        [...clipsEl.children].forEach(el => {
+          el.dataset.selected = (selectedClip && el.dataset.name === selectedClip.name) ? 'true' : 'false';
+          el.dataset.active = activeName && el.dataset.name === activeName ? 'true' : 'false';
+        });
+
+        const hasSel = !!selectedClip;
+        recordBtn.disabled = !hasSel;
+        addComboBtn.disabled = !hasSel || recPanel.style.display !== 'block';
+        exportMapBtn.disabled = !Object.keys(keyMap).length;
+        recTitle.textContent = `Mapping for: ${selectedClip ? selectedClip.name : '—'}`;
+        renderComboList();
+      }
+
+      function selectClip(clip) {
+        selectedClip = clip;
+        recPanel.style.display = 'block';
+        recordBtn.textContent = 'Recording ready';
+        recordBtn.disabled = false;
+        addComboBtn.disabled = false;
+        buildClipsUI();
+      }
+
+      function renderComboList() {
+        comboListEl.innerHTML = '';
+        if (!selectedClip) return;
+        const combos = keyMap[selectedClip.name] || [];
+        combos.forEach((combo, idx) => {
+          const wrap = document.createElement('span');
+          wrap.className = 'item';
+          const tag = document.createElement('span');
+          tag.className = 'comboBadge';
+          tag.textContent = combo;
+          const rm = document.createElement('button');
+          rm.className = 'rm';
+          rm.textContent = '✕';
+          rm.title = 'Remove this combo';
+          rm.onclick = () => {
+            const arr = keyMap[selectedClip.name] || [];
+            arr.splice(idx,1);
+            if (!arr.length) delete keyMap[selectedClip.name];
+            saveMapToStorage();
+            rebuildReverseMap();
+            buildClipsUI();
+            refreshClipSelection();
+          };
+          wrap.appendChild(tag); wrap.appendChild(rm);
+          comboListEl.appendChild(wrap);
+        });
+      }
+
+      // ---------- model load ----------
       function clearCurrent() {
         if (currentAction) { currentAction.stop(); currentAction = null; }
         if (mixer) { try { mixer.stopAllAction(); } catch{} }
@@ -144,167 +398,18 @@
         if (currentRoot) { scene.remove(currentRoot); currentRoot = null; }
         actions.clear();
         clips = [];
-        roles.idle = roles.walk = roles.run = roles.crouchIdle = roles.crouchWalk = null;
+        selectedClip = null;
+        recPanel.style.display = 'none';
+        recordBtn.disabled = true;
+        addComboBtn.disabled = true;
+        exportMapBtn.disabled = true;
         clipsEl.innerHTML = '';
+        reverseMap.clear();
+        defaultClipName = null;
+        anchorBone = null;
+        _anchorBase.set(0,0,0);
       }
 
-      function buildUI() {
-        clipsEl.innerHTML = '';
-        clips.forEach((clip, i) => {
-          const btn = document.createElement('button');
-          btn.textContent = clip.name || `Clip ${i+1}`;
-          btn.onclick = () => {
-            autoToggle.checked = false; // manual override
-            playClipByName(clip.name);
-            log(`playing: ${clip.name}`);
-          };
-          clipsEl.appendChild(btn);
-        });
-      }
-
-      function autoMapRoles() {
-        if (!clips.length) return;
-
-        // Pre-index names (normalized)
-        const entries = clips.map(c => ({ clip:c, name:norm(c.name) }));
-
-        const pickExact = (...names) => {
-          const candidates = names.map(norm);
-          return entries.find(e => candidates.includes(e.name))?.clip || null;
-        };
-
-        const pickContains = (names, { disallow=[] } = {}) => {
-          const nset = names.map(norm);
-          // score: prefer first name that is a whole-word match, and penalize disallowed terms
-          let best = null, bestScore = -1e9;
-          for (const e of entries) {
-            if (disallow.length && hasAny(e.name, disallow)) continue;
-            let score = 0;
-            for (let i=0;i<nset.length;i++) {
-              const n = nset[i];
-              if (e.name === n) score += 100 - i; // exact
-              else if (containsWord(e.name, n)) score += 60 - i; // whole-word
-              else if (e.name.includes(n)) score += 20 - i; // substring
-            }
-            // minor tie-break: shorter names (more specific) win
-            score -= e.name.length * 0.01;
-            if (score > bestScore) { bestScore = score; best = e.clip; }
-          }
-          return best;
-        };
-
-        // Idle family (avoid crouch variants)
-        roles.idle = pickExact('idle','breathing','stand','standing') ||
-                     pickContains(['idle','breathing','stand','standing'], { disallow: DISALLOW_FOR_WALK });
-
-        // Walk (explicitly exclude crouch/sneak/stealth/crawl)
-        roles.walk = pickExact('walk','walking') ||
-                     pickContains(['walk','walking','locomotion','move','moving'], { disallow: DISALLOW_FOR_WALK });
-
-        // Run (prefer sprint, then run, then jog; exclude crouch-like)
-        roles.run = pickExact('sprint','run','jog') ||
-                    pickContains(['sprint','run','jog'], { disallow: DISALLOW_FOR_RUN });
-
-        // Crouch Walk / Idle
-        roles.crouchWalk = pickExact('crouch walk','sneak walk','stealth walk','crawl') ||
-                           pickContains(['crouch walk','sneak walk','stealth walk','crawl']);
-        roles.crouchIdle = pickExact('crouch idle','crouch','sneak idle','sneak','stealth idle','stealth') ||
-                           pickContains(['crouch idle','crouch','sneak idle','sneak','stealth idle','stealth']);
-
-        console.log('Roles:', Object.fromEntries(Object.entries(roles).map(([k,v])=>[k, v?.name||'—'])));
-      }
-
-      function playClipByName(name, fade=0.2, opts={}) {
-        const clip = clips.find(c => c.name === name);
-        if (clip) playClip(clip, fade, opts);
-      }
-
-      function playRole(role, opts={}) {
-        const clip = roles[role];
-        if (!clip) return false;
-        playClip(clip, 0.2, opts);
-        log(`auto: ${role} (${clip.name})`);
-        return true;
-      }
-
-      function playClip(clip, fade=0.2, { speed=1.0 } = {}) {
-        if (!mixer || !clip) return;
-        const next = actions.get(clip.name) || mixer.clipAction(clip);
-
-        // normalize speed on all, then set active
-        actions.forEach(a => a.setEffectiveTimeScale(1));
-        next.setEffectiveTimeScale(speed);
-
-        next.reset();
-        next.setLoop(THREE.LoopRepeat, Infinity);
-        next.enabled = true;
-        next.setEffectiveWeight(1);
-        next.play();
-
-        if (currentAction && currentAction !== next) currentAction.crossFadeTo(next, fade, false);
-        currentAction = next;
-      }
-
-      function updateAutoState() {
-        const moving = input.f || input.b || input.l || input.r;
-
-        // Ctrl fully gates crouch states
-        if (input.ctrl) {
-          if (moving) {
-            if (!playRole('crouchWalk')) {
-              if (!playRole('crouchIdle')) playRole('idle');
-            }
-          } else {
-            if (!playRole('crouchIdle')) {
-              if (!playRole('crouchWalk')) playRole('idle');
-            }
-          }
-          return;
-        }
-
-        // Not crouching → normal locomotion
-        if (moving && input.shift) {
-          if (!playRole('run')) {
-            if (!playRole('walk', { speed:1.6 })) playRole('idle');
-          }
-        } else if (moving) {
-          if (!playRole('walk')) playRole('idle');
-        } else {
-          playRole('idle');
-        }
-      }
-
-      // ---------- input listeners ----------
-      addEventListener('keydown', (e) => {
-        if (e.repeat) return;
-        switch (e.code) {
-          case 'ArrowUp': case 'KeyW': input.f = true; break;
-          case 'ArrowDown': case 'KeyS': input.b = true; break;
-          case 'ArrowLeft': case 'KeyA': input.l = true; break;
-          case 'ArrowRight': case 'KeyD': input.r = true; break;
-          case 'ShiftLeft': case 'ShiftRight': input.shift = true; break;
-          case 'ControlLeft': case 'ControlRight': input.ctrl = true; break;
-        }
-        if (autoToggle.checked && (movementKeys.has(e.code) || e.code.startsWith('Shift') || e.code.startsWith('Control'))) {
-          updateAutoState();
-        }
-      });
-
-      addEventListener('keyup', (e) => {
-        switch (e.code) {
-          case 'ArrowUp': case 'KeyW': input.f = false; break;
-          case 'ArrowDown': case 'KeyS': input.b = false; break;
-          case 'ArrowLeft': case 'KeyA': input.l = false; break;
-          case 'ArrowRight': case 'KeyD': input.r = false; break;
-          case 'ShiftLeft': case 'ShiftRight': input.shift = false; break;
-          case 'ControlLeft': case 'ControlRight': input.ctrl = false; break;
-        }
-        if (autoToggle.checked && (movementKeys.has(e.code) || e.code.startsWith('Shift') || e.code.startsWith('Control'))) {
-          updateAutoState();
-        }
-      });
-
-      // ---------- model loading ----------
       async function parseFileToGLTF(file) {
         const buf = await file.arrayBuffer();
         return new Promise((resolve, reject) => {
@@ -315,7 +420,6 @@
       async function loadModelFromGLTF(gltf, label = '') {
         clearCurrent();
 
-        // add to scene
         currentRoot = gltf.scene;
         scene.add(currentRoot);
 
@@ -325,10 +429,9 @@
           return;
         }
 
-        // mixer root: node vs bones binding
+        // mixer root
         const useBonesBinding = animationsUseBonesBinding(clips);
         const mixRoot = useBonesBinding ? (getFirstSkinnedMesh(currentRoot) || currentRoot) : currentRoot;
-
         mixer = new THREE.AnimationMixer(mixRoot);
 
         // skeleton helper
@@ -339,7 +442,7 @@
         scene.add(helper);
         skelToggle.addEventListener('change', () => { if (helper) helper.visible = skelToggle.checked; });
 
-        // cache actions
+        // actions
         actions.clear();
         for (const clip of clips) {
           const act = mixer.clipAction(clip);
@@ -350,41 +453,270 @@
           actions.set(clip.name, act);
         }
 
-        // build UI + map roles
-        buildUI();
-        autoMapRoles();
+        // default fallback
+        const def = chooseDefaultClip(clips);
+        defaultClipName = def?.name || clips[0].name;
 
-        // start based on current keys (usually idle)
-        updateAutoState();
+        // anchor bone (for keeping centered)
+        const skinned = getFirstSkinnedMesh(currentRoot);
+        if (skinned?.skeleton?.bones?.length) {
+          anchorBone = skinned.skeleton.bones.find(b => ANCHOR_BONE_CANDIDATES.includes(b.name)) || skinned.skeleton.bones[0];
+        } else {
+          anchorBone = null;
+        }
+        scene.updateMatrixWorld(true);
+        if (anchorBone) anchorBone.getWorldPosition(_anchorBase);
 
-        const name = label || 'model';
-        log(`Loaded ${name} — ${clips.length} clip(s). Use arrow keys/WASD, Shift=run, Ctrl=crouch.`);
+        buildClipsUI();
+        buildModelSignature();
+        loadMapFromStorage();
+        buildClipsUI();
+
+        // start on default
+        playClipByName(defaultClipName, FADE_DUR);
+        log(`Loaded ${label || 'model'} — ${clips.length} clip(s). Mapping-only; default is “${defaultClipName}”.`);
       }
 
-      // Load by URL (optional default)
       async function loadModelFromURL(url) {
-        return new Promise((resolve, reject) => {
-          loader.load(url, resolve, undefined, reject);
-        }).then(async (gltf) => loadModelFromGLTF(gltf, url.split('/').pop()));
+        return new Promise((resolve, reject) => loader.load(url, resolve, undefined, reject))
+          .then((gltf) => loadModelFromGLTF(gltf, url.split('/').pop()));
+      }
+
+      // ---------- play helpers ----------
+      function playClipIfChanged(clip, fade=FADE_DUR, opts={}) {
+        if (!mixer || !clip) return;
+        const currentName = currentAction?.getClip?.().name;
+        if (currentName === clip.name) {
+          if (opts && typeof opts.speed === 'number') currentAction.setEffectiveTimeScale(opts.speed);
+          return;
+        }
+        playClip(clip, fade, opts);
+      }
+
+      function playClip(clip, fade=FADE_DUR, { speed=1.0 } = {}) {
+        if (!mixer || !clip) return;
+        const next = actions.get(clip.name) || mixer.clipAction(clip);
+        if (!currentAction || currentAction !== next) next.reset();
+
+        actions.forEach(a => a.setEffectiveTimeScale(1));
+        next.setEffectiveTimeScale(speed);
+
+        next.setLoop(THREE.LoopRepeat, Infinity);
+        next.enabled = true;
+        next.setEffectiveWeight(1);
+        next.play();
+
+        if (currentAction && currentAction !== next) currentAction.crossFadeTo(next, fade, false);
+        currentAction = next;
+        refreshClipSelection(clip.name);
+      }
+
+      function playClipByName(name, fade=FADE_DUR, opts={}) {
+        const clip = clips.find(c => c.name === name);
+        if (clip) playClipIfChanged(clip, fade, opts);
+      }
+
+      // ---------- mapping-only playback ----------
+      function updateMappingPlay() {
+        if (!mixer) return;
+        const combo = canonicalizeComboFromSet(pressedNow);
+        const animName = reverseMap.get(combo) || null;
+
+        // highlight
+        [...clipsEl.children].forEach(el => el.dataset.active = (el.dataset.name === animName ? 'true' : 'false'));
+
+        if (animName) {
+          playClipByName(animName, FADE_DUR);
+        } else if (defaultClipName) {
+          playClipByName(defaultClipName, FADE_DUR);
+        }
+      }
+
+      // ---------- input listeners ----------
+      addEventListener('keydown', (e) => {
+        pressedNow.add(e.code);
+
+        if (recordingActive) {
+          e.preventDefault();
+          recordHeld.add(e.code);
+          startCountdown(COUNTDOWN_SECS);
+          updateRecordHint();
+          return;
+        }
+
+        // prevent browser defaults for nav keys while driving mappings
+        if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault();
+
+        updateMappingPlay();
+      }, { passive: false });
+
+      addEventListener('keyup', (e) => {
+        pressedNow.delete(e.code);
+        if (!recordingActive) updateMappingPlay();
+      });
+
+      // ---------- keep character centered (root-motion neutralization) ----------
+      function recenterCharacter() {
+        if (!currentRoot) return;
+
+        // 1) Neutralize any node-binding root translation (animations that move the scene/group)
+        currentRoot.position.set(0, currentRoot.position.y, 0);
+
+        // 2) If we have a skeleton anchor (e.g., Hips), counter its X/Z drift so the character stays near origin.
+        if (anchorBone) {
+          anchorBone.getWorldPosition(_tmpWorld);
+          const dx = _tmpWorld.x - _anchorBase.x;
+          const dz = _tmpWorld.z - _anchorBase.z;
+          // move the whole root opposite to hip drift in XZ; keep Y as-is so crouch/bob still renders naturally
+          currentRoot.position.x = -dx;
+          currentRoot.position.z = -dz;
+          // keep orientation free; we’re only fixing center, not rotation
+        }
+      }
+
+      // ---------- mapping recorder ----------
+      function openRecorder() {
+        if (!selectedClip) return;
+        recPanel.style.display = 'block';
+        recordBtn.textContent = 'Recording ready';
+        addComboBtn.disabled = false;
+        refreshClipSelection();
+      }
+
+      function updateRecordHint() {
+        const combo = canonicalizeComboFromSet(recordHeld);
+        recHint.textContent = recordHeld.size
+          ? `Recording: ${combo}`
+          : 'Press keys together. Each press refreshes the 3s countdown.';
+      }
+
+      function startCountdown(seconds) {
+        stopCountdown();
+        let left = seconds;
+        countdownEl.textContent = `Locking in ${left}…`;
+        countdownTimer = setInterval(() => {
+          left--;
+          if (left <= 0) {
+            stopCountdown();
+            finalizeRecordedCombo();
+          } else {
+            countdownEl.textContent = `Locking in ${left}…`;
+          }
+        }, 1000);
+      }
+
+      function stopCountdown() {
+        if (countdownTimer) {
+          clearInterval(countdownTimer);
+          countdownTimer = null;
+          countdownEl.textContent = '';
+        }
+      }
+
+      function finalizeRecordedCombo() {
+        const combo = canonicalizeComboFromSet(recordHeld);
+        if (!selectedClip || !combo) {
+          recHint.textContent = 'Nothing recorded.';
+          recordingActive = false;
+          startRecordBtn.textContent = 'Record key combination';
+          startRecordBtn.disabled = false;
+          return;
+        }
+        keyMap[selectedClip.name] = keyMap[selectedClip.name] || [];
+        if (!keyMap[selectedClip.name].includes(combo)) {
+          keyMap[selectedClip.name].push(combo);
+          saveMapToStorage();
+          rebuildReverseMap();
+          buildClipsUI();
+          renderComboList();
+          exportMapBtn.disabled = false;
+          log(`Mapped ${selectedClip.name} ⇐ ${combo}`);
+        } else {
+          log(`Combo already exists for ${selectedClip.name}`);
+        }
+        recordingActive = false;
+        recordHeld.clear();
+        startRecordBtn.textContent = 'Record key combination';
+        startRecordBtn.disabled = false;
+        recHint.textContent = 'Press keys together. Each press refreshes the 3s countdown.';
+        countdownEl.textContent = '';
+      }
+
+      recordBtn.onclick = () => { if (selectedClip) openRecorder(); };
+      addComboBtn.onclick = () => { openRecorder(); startRecordBtn.focus(); };
+
+      startRecordBtn.onclick = () => {
+        if (!selectedClip) return;
+        recordingActive = true;
+        recordHeld.clear();
+        stopCountdown();
+        startRecordBtn.textContent = 'Recording… (press keys)';
+        startRecordBtn.disabled = true;
+        updateRecordHint();
+      };
+
+      exportMapBtn.onclick = () => {
+        const out = {};
+        Object.keys(keyMap).forEach(name => { if (keyMap[name]?.length) out[name] = keyMap[name]; });
+        const fname = `anim_keymap_${(modelSig||'model').slice(0,40).replace(/[^a-z0-9_\-\.]+/gi,'_')}.json`;
+        downloadText(fname, JSON.stringify(out, null, 2));
+      };
+
+      // ---------- mapping import ----------
+      async function parseMappingJSON(file) {
+        const text = await file.text();
+        let obj = {};
+        try { obj = JSON.parse(text); }
+        catch { throw new Error('Invalid JSON'); }
+        if (typeof obj !== 'object' || Array.isArray(obj)) throw new Error('Mapping must be { animName: [combos] }');
+        return obj;
+      }
+
+      function importMappingObject(obj) {
+        if (!clips.length) { log('Load a model before importing a mapping.'); return; }
+        let added = 0, matched = 0;
+        const clipNames = new Set(clips.map(c => c.name));
+        for (const [name, arr] of Object.entries(obj)) {
+          if (!clipNames.has(name)) continue;
+          if (!Array.isArray(arr)) continue;
+          keyMap[name] = keyMap[name] || [];
+          for (const raw of arr) {
+            const combo = canonicalizeComboString(raw);
+            if (!combo) continue;
+            if (!keyMap[name].includes(combo)) { keyMap[name].push(combo); added++; }
+          }
+          if (arr.length) matched++;
+        }
+        saveMapToStorage();
+        rebuildReverseMap();
+        buildClipsUI();
+        exportMapBtn.disabled = !Object.keys(keyMap).length;
+        log(`Imported mapping: ${added} combos across ${matched} clips. Mapping-only mode active.`);
       }
 
       // ---------- drag & drop + file input ----------
       function showDrop(v){ dropZone.style.display = v ? 'grid' : 'none'; }
-
       addEventListener('dragenter', (e) => { e.preventDefault(); showDrop(true); });
       addEventListener('dragover',  (e) => { e.preventDefault(); showDrop(true); });
       addEventListener('dragleave', (e) => { e.preventDefault(); showDrop(false); });
       addEventListener('drop', async (e) => {
         e.preventDefault(); showDrop(false);
-        const files = [...(e.dataTransfer?.files || [])].filter(f => /\.(glb|gltf)$/i.test(f.name));
+        const files = [...(e.dataTransfer?.files || [])];
         if (!files.length) return;
-        const file = files[0]; // viewer supports one model at a time
+        const file = files[0];
         try {
-          const gltf = await parseFileToGLTF(file);
-          await loadModelFromGLTF(gltf, file.name);
+          if (/\.(json)$/i.test(file.name)) {
+            const obj = await parseMappingJSON(file);
+            importMappingObject(obj);
+          } else if (/\.(glb|gltf)$/i.test(file.name)) {
+            const gltf = await parseFileToGLTF(file);
+            await loadModelFromGLTF(gltf, file.name);
+          } else {
+            log('Unsupported file. Drop a .glb/.gltf model or a .json mapping.');
+          }
         } catch (err) {
           console.error(err);
-          log('Failed to load dropped file (prefer .glb): ' + (err?.message || err));
+          log('Failed to load file: ' + (err?.message || err));
         }
       });
 
@@ -393,11 +725,16 @@
         const file = e.target.files && e.target.files[0];
         if (!file) return;
         try {
-          const gltf = await parseFileToGLTF(file);
-          await loadModelFromGLTF(gltf, file.name);
+          if (/\.(json)$/i.test(file.name)) {
+            const obj = await parseMappingJSON(file);
+            importMappingObject(obj);
+          } else {
+            const gltf = await parseFileToGLTF(file);
+            await loadModelFromGLTF(gltf, file.name);
+          }
         } catch (err) {
           console.error(err);
-          log('Failed to load selected file (prefer .glb): ' + (err?.message || err));
+          log('Failed to load selected file: ' + (err?.message || err));
         } finally {
           fileInput.value = '';
         }
@@ -408,6 +745,7 @@
       renderer.setAnimationLoop(() => {
         const dt = clock.getDelta();
         if (mixer) mixer.update(dt);
+        recenterCharacter(); // keep centered every frame
         controls.update();
         renderer.render(scene, camera);
       });
@@ -418,8 +756,7 @@
         renderer.setSize(innerWidth, innerHeight);
       });
 
-      // OPTIONAL: auto-load a default model by URL.
-      // Comment this out if you only want drag/drop.
+      // OPTIONAL: auto-load by URL
       // loadModelFromURL('/models/consolidated.glb').catch(()=>{});
     </script>
   </body>
